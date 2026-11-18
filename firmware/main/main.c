@@ -77,6 +77,7 @@ static void privacy_save(int mode)
     if (nvs_open("keypet", NVS_READWRITE, &h) != ESP_OK) return;
     if (nvs_set_i8(h, "privacy", (int8_t)mode) == ESP_OK) nvs_commit(h);
     nvs_close(h);
+    ble_companion_privacy(mode);
 }
 
 static void privacy_load(void)
@@ -107,6 +108,7 @@ void settings_save(void)
     nvs_set_u8(h, "bright", (uint8_t)bright);
     nvs_set_u8(h, "eco", pip_eco_on());
     nvs_set_i8(h, "privacy", (int8_t)phone_privacy());
+    nvs_set_i8(h, "phonetype", (int8_t)phone_type());
     nvs_commit(h);
     nvs_close(h);
 }
@@ -132,6 +134,8 @@ static void settings_load(void)
         if (nvs_get_u8(h, "bright", &b) == ESP_OK) bright = b < 10 ? 10 : b > 100 ? 100 : b;
         if (nvs_get_u8(h, "eco", &eco) == ESP_OK) pip_eco(eco);
         if (nvs_get_blob(h, "profile", &profile, &n) != ESP_OK || n != sizeof profile) n = 0; /* a size of its own: the defaults stay */
+        int8_t pt;
+        if (nvs_get_i8(h, "phonetype", &pt) == ESP_OK) phone_set_type(pt);
         nvs_close(h);
     }
     profile_on_change(profile_save);
@@ -840,5 +844,6 @@ void app_main(void)
     xTaskCreate(sensors_task, "sensors", 4096, NULL, 5, NULL);
     xTaskCreate(audio_task, "audio", 4096, NULL, 6, NULL);
     ble_start();
+    ble_set_phone_type(phone_type()); /* apply the user's choice from NVS */
     debug_start();
 }

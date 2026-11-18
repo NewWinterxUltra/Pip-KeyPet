@@ -27,7 +27,8 @@ static struct {
     int host;                          /* the fake computer: HOST_* */
     int nexts, prevs, clicks, mx, my, moves, scroll, drags, held; /* what the remote sent it */
     const char *media;                 /* the last media key */
-} fp = {.vol = 0.5f, .last = ""};
+    int type;                          /* PHONE_TYPE_*: what the fake phone is */ 
+} fp = {.vol = 0.5f, .type = PHONE_TYPE_IPHONE};
 
 static float pos_now(void) { return fp.pos + (fp.playing ? lv_tick_elaps(fp.at) / 1000.0f : 0); }
 
@@ -78,12 +79,16 @@ static void on_host(int what, int dx, int dy)
 static void bt_query(phone_bt_t *s) /* the Bluetooth page: the pretend phone and computer */
 {
     s->n = 0, s->bonds = 2, s->advertising = true;
-    if (fp.link == PHONE_ON) s->peer[s->n++] = (phone_peer_t){.role = PEER_PHONE, .rssi = -52, .secs = 754, .encrypted = true, .bonded = true, .ready = true, .ancs = true, .ams = true, .cts = true};
+    if (fp.link == PHONE_ON) s->peer[s->n++] = (phone_peer_t){.role = PEER_PHONE, .rssi = -52, .secs = 754, .encrypted = true, .bonded = true, .ready = true, .ancs = fp.type == PHONE_TYPE_IPHONE, .ams = fp.type == PHONE_TYPE_IPHONE, .cts = true, .type = fp.type};
     if (fp.host == HOST_ON) s->peer[s->n++] = (phone_peer_t){.role = PEER_COMPUTER, .rssi = -61, .secs = 120, .encrypted = true, .bonded = true};
 }
 static void bt_act(int what) { fp.last = what == BT_RECONNECT_PHONE ? "bt reconnect" : "bt forget"; }
 
 void fake_phone_init(void) { phone_on_command(on_command), phone_on_host(on_host), phone_on_bt(bt_query, bt_act); }
+
+/* Set the fake phone type (PHONE_TYPE_*). Android/Windows use generic notifications instead of ANCS/AMS. */
+void fake_phone_set_type(int type) { if (type >= 0 && type < PHONE_TYPE_COUNT) fp.type = type; }
+int fake_phone_type(void) { return fp.type; }
 
 void fake_host(int arg) /* X0 gone, X1 a computer asks to pair (the code on screen), X2 a paired one is back */
 {
@@ -99,7 +104,7 @@ const char *fake_host_report(void)
              fp.scroll, fp.media ? fp.media : "-", fp.drags, fp.held);
     return s;
 }
-const char *fake_phone_last(void) { return fp.last; }
+const char *fake_phone_last(void) { return fp.last ? fp.last : ""; }
 int fake_phone_shots(void) { return fp.shots; }
 
 void fake_phone(char kind, int arg)

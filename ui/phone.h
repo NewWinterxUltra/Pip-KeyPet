@@ -7,6 +7,8 @@
 #include <stdint.h>
 
 enum { PHONE_OFF, PHONE_PAIRING, PHONE_ON };
+/* what kind of phone is linked: iPhone (ANCS/AMS), Android or Windows (generic GATT) */
+enum { PHONE_TYPE_IPHONE, PHONE_TYPE_ANDROID, PHONE_TYPE_WINDOWS, PHONE_TYPE_COUNT };
 enum {
     PHONE_NOTE_DISMISS, /* ANCS negative action: clears it on the phone too */
     PHONE_CALL_ANSWER,  /* ANCS positive / negative on the incoming-call notification */
@@ -29,6 +31,11 @@ void phone_note_gone(uint32_t uid);
 void phone_call(uint32_t uid, const char *name, const char *kind);             /* name NULL: the call is over */
 void phone_track(const char *title, const char *artist, int dur_s, float pos_s, bool playing); /* title NULL: nothing */
 void phone_volume(float v);                                                     /* 0..1 */
+
+/* ---------- phone type: iPhone, Android, Windows ---------- */
+void phone_set_type(int type);                                                  /* which protocol the linked phone speaks */
+int  phone_type(void);                                                          /* PHONE_TYPE_* */
+const char *phone_type_name(int type);                                          /* "iphone", "android", "windows" */
 
 /* ---------- UI -> host ---------- */
 void phone_on_command(void (*cb)(int cmd, uint32_t uid));
@@ -71,6 +78,7 @@ enum { PEER_PHONE, PEER_COMPUTER, PEER_DEBUG, PEER_UNKNOWN };
 typedef struct {
     int role, rssi, secs;               /* rssi in dBm (0: unknown), how long it has been connected */
     bool encrypted, bonded, ready, ancs, ams, cts; /* ready..cts: the phone's services */
+    int type;                           /* PHONE_TYPE_*: what the linked phone speaks */
 } phone_peer_t;
 typedef struct { int n, bonds; bool advertising; phone_peer_t peer[5]; } phone_bt_t;
 enum { BT_RECONNECT_PHONE, BT_FORGET_ALL };

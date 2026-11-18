@@ -189,9 +189,9 @@ int main(int argc, char **argv)
                      : png                      ? ""
                                                 : "-pix_fmt yuv420p";
     char cmd[1024];
-    snprintf(cmd, sizeof cmd, "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - %s '%s'", S, S,
+    snprintf(cmd, sizeof cmd, "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - %s \"%s\"", S, S,
              fps, vf, out);
-    FILE *ff = popen(cmd, "w");
+    FILE *ff = popen(cmd, "wb");
     if (!ff) { perror("ffmpeg"); return 1; }
 
     int frames = (int)lroundf(secs * fps);

@@ -13,3 +13,15 @@ private/
 pip video/
 firmware/build-release/
 build-pub/
+apps/android/.gradle/
+apps/android/app/build/
+apps/android/local.properties
+apps/windows/build/
+apps/windows/dist/
+apps/windows/*.spec
+*.log
+*.pyc
+__pycache__/
+apps/android/jstack.txt
+apps/android/PipLink.apk
+apps/windows/PipLink-Windows.zip

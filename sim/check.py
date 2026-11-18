@@ -433,7 +433,7 @@ ok &= check("sound off in the care app mutes him", muted < 50, muted)
 # Quick QR: every code on screen must scan back to its link (a phone camera's job, done by OpenCV)
 try:
     import cv2
-    links = re.findall(r'"(https?://[^"]+)"', open(os.path.join(os.path.dirname(__file__), "..", "ui", "profile.c")).read())  # the default links
+    links = re.findall(r'"(https?://[^"]+)"', open(os.path.join(os.path.dirname(__file__), "..", "ui", "profile.c"), encoding="utf-8").read())  # the default links
     for theme in (0, 3):  # dark modules on white, and the terminal's background-coloured modules on its ink plate
         ev = f"0.1:H{theme} 0.2:oqr"
         for k in range(len(links)):

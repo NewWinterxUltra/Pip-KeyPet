@@ -4,8 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 KeyPet: firmware for a Waveshare ESP32-S3-Touch-AMOLED-1.75C keychain (466×466 round AMOLED, CO5300 over QSPI,
 CST9217 touch, QMI8658 accelerometer, AXP2101 power, ES8311 speaker, ES7210 mics, 8 MB PSRAM, 32 MB flash).
-The character is **Pip** (white eyes, moods driven by a tamagotchi model), plus a menu of apps and an iPhone link
-over BLE. The owner speaks Russian: UI text, commit messages and replies are in Russian.
+The character is **Pip** (white eyes, moods driven by a tamagotchi model), plus a menu of apps and a phone link over
+BLE: iPhone uses Apple's ANCS/AMS/CTS; Android and Windows use the **Pip Link** companion app in `apps/`.
+The owner speaks Russian: UI text, commit messages and replies are in Russian.
 
 ## Three targets, one UI
 
@@ -13,7 +14,7 @@ over BLE. The owner speaks Russian: UI text, commit messages and replies are in 
 - **headless recorder** `pipsim` (sim/main.c) — deterministic runs to PNG/GIF/MP4, used for every visual check;
 - **web simulator** (sim/wasm.c → sim/web, Emscripten) — interactive, on a 3D model of the keychain;
 - **firmware** (firmware/main, ESP-IDF 5.5) — main.c is the board glue (display port, sensors, power, audio),
-  ble.c the iPhone link, debug.c the debug link.
+  ble.c the phone link (ANCS for iPhone, Pip Link for Android/Windows), debug.c the debug link.
 
 When adding a `ui/*.c` file, add it to both `sim/CMakeLists.txt` (`set(UI ...)`) and
 `firmware/main/CMakeLists.txt` (`SRCS`). Fonts in `ui/fonts/font_*_*.c` are globbed: after adding one, re-run cmake
@@ -31,6 +32,10 @@ python3 sim/serve.py                                           # web sim on :846
 firmware/flash.sh [secs]          # idf.py build + flash + print the log for N s (finds /dev/cu.usbmodem* itself)
 python firmware/serlog.py 20 [--reset]   # just the log (needs the IDF env: . ~/esp/esp-idf/export.sh)
 tools/pipdebug.sh                 # debug page http://localhost:8765 (USB, or the page's Bluetooth button in Chrome)
+
+cd apps/android && ./gradlew assembleDebug    # Pip Link APK (JDK 17, Android SDK 34)
+python apps/windows/pip_link.py               # Pip Link for Windows (needs bleak)
+python tools/check_companion.py                # UUID/messages agree across firmware, apps and docs
 ```
 
 - A single check is just a pipsim run: the last stdout line is `status: mood=… reaction=… screen=… theme=…`;
@@ -96,6 +101,15 @@ held + the gyroscope = pointer, a tap = click. The music app sends media keys to
 (a tap switches to the iPhone). The bottom key's release reaches apps as `shell_button_up` (`.button_up`).
 In the sim the computer is `fakephone.c` too (event `X0/1/2`, `B<s>` holds the bottom key; the status ends with
 `host=… nexts=… prevs=… clicks=… mx=… my=… scroll=… media=…`).
+
+**Pip Link** (`firmware/main/ble.c` ↔ `apps/android`, `apps/windows`, protocol in `docs/companion.md`): Android and
+Windows have no system notification service like ANCS, so a small companion app is the BLE central. It writes
+line messages to service `50495044-4247-4b45-5950-455400000010`, RX `...0011` (write, encrypted), and receives
+commands on TX `...0012`: app→Pip `HELLO`, `TIME`, `NOTE`, `NOTE_GONE`, `CALL`, `CALL_END`, `TRACK`, `VOL`, `PING`;
+Pip→app `CMD DISMISS/ANSWER/DECLINE/PLAY_PAUSE/NEXT/PREV/VOL_*`, `PRIVACY`, `STATE`, `PONG`. `decide()` for a
+non-iPhone phone waits for `HELLO` instead of discovering ANCS; `comp_ready` and the iPhone's `b.ready` share
+`link_sync()`. The old `generic_*` GATT path is dead code (one unused-function warning). Privacy is pushed to the app
+(`ble_companion_privacy`), so `PHONE_PRIV_OFF` means the text never leaves the phone/PC.
 
 **Board display port** (firmware/main/main.c): own LVGL port, DIRECT mode into one PSRAM frame buffer
 (RGB565_SWAPPED), flush waits for the panel's TE pulse and streams dirty rows in 8 KB DMA chunks at 80 MHz QSPI;

@@ -41,8 +41,9 @@ static struct {
     int host;        /* HOST_*: a computer, for the remote */
     bool pair_host;  /* the pairing overlay is the computer's */
     bool mu_phone;   /* the music app drives the iPhone though a computer is here too (a tap switches) */
+    int type;        /* PHONE_TYPE_*: what the linked phone speaks (iphone/android/windows) */
     void (*host_cb)(int what, int dx, int dy);
-} ph = {.vol = 0.5f};
+} ph = {.vol = 0.5f, .type = PHONE_TYPE_IPHONE};
 
 static void send(int cmd, uint32_t uid)
 {
@@ -50,6 +51,14 @@ static void send(int cmd, uint32_t uid)
 }
 
 void phone_on_command(void (*cb)(int, uint32_t)) { ph.cb = cb; }
+
+void phone_set_type(int type) { if (type >= 0 && type < PHONE_TYPE_COUNT) ph.type = type; }
+int  phone_type(void) { return ph.type; }
+const char *phone_type_name(int type)
+{
+    static const char *const names[PHONE_TYPE_COUNT] = {"iphone", "android", "windows"};
+    return type >= 0 && type < PHONE_TYPE_COUNT ? names[type] : names[PHONE_TYPE_IPHONE];
+}
 
 const char *phone_command_name(int cmd)
 {
@@ -1315,14 +1324,16 @@ static void bt_update(lv_timer_t *t)
     (void)t;
     phone_bt_t s = {0};
     if (bt.query) bt.query(&s);
-    static const char *const who[3] = {"iphone", "компьютер", "отладка"};
+    static const char *const who[3] = {"телефон", "компьютер", "отладка"};
     for (int r = 0; r < 3; r++) {
         const phone_peer_t *p = NULL;
         for (int i = 0; i < s.n; i++)
             if (s.peer[i].role == r) p = &s.peer[i];
         char a[64], d[128], d2[96] = "";
         bool good = p && p->encrypted && (r != PEER_PHONE || p->ready);
-        snprintf(a, sizeof a, "%s%s", who[r], good ? "" : p ? " · подключается" : ""); /* the colour says it too */
+        const char *kind = who[r];
+        if (r == PEER_PHONE && p) kind = phone_type_name(p->type);
+        snprintf(a, sizeof a, "%s%s", kind, good ? "" : p ? " · подключается" : ""); /* the colour says it too */
         if (!p) snprintf(d, sizeof d, "%s", r == PEER_DEBUG ? "не подключена" : "не подключён");
         else {
             int k = snprintf(d, sizeof d, "%s", p->encrypted ? "шифр" : "без шифра");

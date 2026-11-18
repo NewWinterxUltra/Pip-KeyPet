@@ -1,0 +1,3 @@
+bleak>=0.22
+# Optional: track title/artist in the music app (media keys work without it)
+winsdk; platform_system == "Windows"

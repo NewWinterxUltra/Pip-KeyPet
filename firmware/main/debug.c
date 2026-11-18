@@ -8,7 +8,8 @@
    why = [kind, which, value]: the branch of the tree that picked the mood (ui/pet.h pet_mood_why).
    Commands in: mood <i> | auto | react <i> <s> | need <0-4> <v> | day <v> | annoy <v> | urge <i> <line>
                 pool <great> <good> <meh> | set <knob> <v> | feat <f> <0|1> | eco <0|1> | bat [clear] | demo <s> [i ...] | hist | names | tune
-                open <app> | home | btn <0|1> | meet | feed | play | sleep | wake | rare [mood] | game <0 won|1 lost|2 record> */
+                open <app> | home | btn <0|1> | meet | feed | play | sleep | wake | rare [mood] | game <0 won|1 lost|2 record>
+                phonetype <0|1|2> (0=iPhone, 1=Android, 2=Windows) */
 #include "board.h"
 #include "esp_pm.h"
 #include "driver/usb_serial_jtag.h"
@@ -194,9 +195,9 @@ static void json_str(char *b, size_t n, const char *s) /* a JSON string, quoted,
 static void config(void) /* @C: everything the settings page shows */
 {
     static char b[1600], t[260];
-    int n = snprintf(b, sizeof b, "@C {\"ver\":\"%s\",\"power\":%d,\"bright\":%d,\"eco\":%d,\"theme\":%d,\"privacy\":%d,\"feat\":[",
+    int n = snprintf(b, sizeof b, "@C {\"ver\":\"%s\",\"power\":%d,\"bright\":%d,\"eco\":%d,\"theme\":%d,\"privacy\":%d,\"phonetype\":%d,\"feat\":[",
                      esp_app_get_description()->version, pip_power_after(), settings_brightness(), pip_eco_on(), theme_index(),
-                     phone_privacy());
+                     phone_privacy(), phone_type());
     for (int f = 0; f < PIP_F_COUNT; f++) n += snprintf(b + n, sizeof b - n, "%s%d", f ? "," : "", pip_feature_on(f));
     const char *names[3] = {profile.first, profile.last, profile.org}, *keys[3] = {"first", "last", "org"};
     n += snprintf(b + n, sizeof b - n, "]");
@@ -274,7 +275,8 @@ static void command(char *line)
     else if (!strcmp(c, "power") && n > 1) pip_power((int)a1), settings_save();      /* seconds to sleep, 0 never */
     else if (!strcmp(c, "eco") && n > 1) pip_eco(a1 != 0), settings_save();              /* energy saving */
     else if (!strcmp(c, "bright") && n > 1) settings_bright((int)a1), settings_save(); /* % */
-    else if (!strcmp(c, "privacy") && n > 1) phone_set_privacy((int)a1), settings_save();
+    else if (!strcmp(c, "privacy") && n > 1) phone_set_privacy((int)a1), ble_companion_privacy((int)a1), settings_save();
+    else if (!strcmp(c, "phonetype") && n > 1) phone_set_type((int)a1), ble_set_phone_type((int)a1), settings_save();
     else if (!strcmp(c, "theme") && n > 1) shell_set_theme((int)a1);                   /* kept by main.c theme_keep */
     else if (!strcmp(c, "demo")) {
         demo_s = (int)a1, demo_n = 0, demo_k = 0, demo_next = 0;

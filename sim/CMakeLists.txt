@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(pipsim C CXX)
 
+# MinGW on Windows hides POSIX reentrant time functions (gmtime_r) unless asked for them.
+if(WIN32)
+    add_compile_definitions(_POSIX_C_SOURCE=200809L)
+endif()
+
 set(LV_BUILD_CONF_PATH ${CMAKE_CURRENT_SOURCE_DIR}/lv_conf.h CACHE PATH "" FORCE)
 set(CONFIG_LV_BUILD_DEMOS OFF CACHE BOOL "" FORCE)
 set(CONFIG_LV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

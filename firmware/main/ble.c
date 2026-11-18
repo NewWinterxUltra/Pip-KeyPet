@@ -25,7 +25,9 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "shell.h"
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -35,6 +37,12 @@ void ble_store_config_init(void);
 
 /* ---------- Apple's UUIDs ---------- */
 static ble_uuid128_t ANCS, ANCS_NS, ANCS_CP, ANCS_DS, AMS, AMS_RC, AMS_EU;
+/* Generic (non-Apple) services: kept for the old discovery code; the Android/Windows path now uses the companion app */
+static ble_uuid128_t GATT_NOTIFY, GATT_NOTIFY_CHR, GATT_MEDIA, GATT_MEDIA_CTRL, GATT_MEDIA_TRACK;
+/* Generic call service for Android/Windows */
+static ble_uuid128_t GATT_CALL, GATT_CALL_STATE, GATT_CALL_CTRL;
+/* Pip Link: the companion app's service (Android/Windows): lines in, lines out (docs/companion.md) */
+static ble_uuid128_t COMP, COMP_RX, COMP_TX, COMP_INFO;
 static const ble_uuid16_t CTS = BLE_UUID16_INIT(0x1805), CTS_TIME = BLE_UUID16_INIT(0x2A2B), CTS_LOCAL = BLE_UUID16_INIT(0x2A0F),
                           CCCD = BLE_UUID16_INIT(0x2902);
 
@@ -69,14 +77,34 @@ static struct {
     bool connected, numcmp, ready; /* ready: discovery done, ANCS requests may go */
     uint16_t svc_start, svc_end; /* the service being looked at */
     uint16_t ns, cp, ds, rc, eu, ct, lt; /* characteristic value handles, 0 = not there */
+    uint16_t cs, cc;                      /* generic call state / call control (Android/Windows) */
     uint16_t cccd;
     int step, retries;
     bool is_phone; /* it said so (Appearance): never taken for a computer, however slow its services are */
     uint32_t call_uid;
-} b = {.conn = BLE_HS_CONN_HANDLE_NONE};
+    int type; /* PHONE_TYPE_*: what this connected phone speaks (set from NVS or appearance) */
+} b = {.conn = BLE_HS_CONN_HANDLE_NONE, .type = PHONE_TYPE_IPHONE};
+
+/* ---------- Pip Link: the companion app on Android/Windows ---------- */
+#define COMP_LINE 640
+static uint16_t comp_conn = BLE_HS_CONN_HANDLE_NONE, comp_tx_handle, comp_info_handle;
+static bool comp_ready; /* it said HELLO: the link is up */
+static char comp_buf[COMP_LINE];
+static int comp_len;
+static bool comp_command(int cmd, uint32_t uid); /* defined with the Pip Link handlers below */
+
+/* Set the phone type (iPhone/Android/Windows): called from main.c after loading NVS. Changing it drops a live
+   phone link so the next connection is asked the right way. */
+void ble_set_phone_type(int type)
+{
+    if (type < 0 || type >= PHONE_TYPE_COUNT || b.type == type) return;
+    b.type = type;
+    if (b.connected) ble_gap_terminate(b.conn, BLE_ERR_REM_USER_CONN_TERM);
+}
 
 static void advertise(void);
 static void step(void);
+static void step_generic(void); /* the old generic GATT path: kept compiled but no longer selected */
 static void key(uint8_t bits);
 static void host_take(uint16_t conn);
 static uint16_t pair_conn = BLE_HS_CONN_HANDLE_NONE; /* the connection the numeric comparison is for */
@@ -90,6 +118,8 @@ static void ui(void (*fn)(void *), void *arg) /* run UI code under the LVGL lock
 static void ui_link_off(void *a) { (void)a; phone_link(PHONE_OFF, 0); }
 static void ui_link_on(void *a) { (void)a; phone_link(PHONE_ON, 0); }
 static void ui_link_pair(void *a) { phone_link(PHONE_PAIRING, *(uint32_t *)a); }
+/* One "phone connected" state for two independent links: the iPhone over ANCS and the companion app. */
+static void link_sync(void) { ui(b.ready || comp_ready ? ui_link_on : ui_link_off, NULL); }
 
 /* ---------- ANCS: notifications ---------- */
 #define Q_MAX 24
@@ -230,14 +260,114 @@ static void ams_update(const uint8_t *d, int len) /* entity, attribute, flags, v
     ui(ui_track, NULL);
 }
 
+/* ---------- generic notifications for Android/Windows ---------- */
+/* Data comes as a pipe-separated UTF-8 line: "app|title|text|hour|min|quiet"
+   quiet = 0: show banner, 1: silent (added to list only). Calls are not supported here. */
+static char gnote_buf[512];
+static int gnote_len;
+
+static void generic_notify_flush(void)
+{
+    if (gnote_len < 3) { gnote_len = 0; return; }
+    gnote_buf[gnote_len] = 0;
+    char app[24] = "", title[48] = "", text[480] = "";
+    int hour = 0, min = 0, quiet = 0;
+    int n = sscanf(gnote_buf, "%23[^|]|%47[^|]|%479[^|]|%d|%d|%d", app, title, text, &hour, &min, &quiet);
+    if (n >= 3) {
+        uint32_t uid = esp_random();
+        phone_note(uid, app[0] ? app : "Уведомления", title[0] ? title : "", text, hour, min, quiet != 0);
+    }
+    gnote_len = 0;
+}
+
+static void generic_notify(const uint8_t *d, int len)
+{
+    if (gnote_len + len >= (int)sizeof gnote_buf) gnote_len = 0; /* overflow: drop */
+    memcpy(gnote_buf + gnote_len, d, len);
+    gnote_len += len;
+    /* a complete message ends with newline */
+    if (len > 0 && d[len - 1] == '\n') generic_notify_flush();
+}
+
+/* ---------- generic call state for Android/Windows ---------- */
+/* "INCOMING|Имя|мобильный\n"  -> incoming call
+   "ENDED\n"                   -> call ended / declined / missed */
+static char call_buf[128];
+static int call_len;
+
+static void generic_call_state_flush(void)
+{
+    if (call_len < 3) { call_len = 0; return; }
+    call_buf[call_len] = 0;
+    char action[16] = "", name[48] = "", kind[24] = "";
+    int n = sscanf(call_buf, "%15[^|]|%47[^|]|%23[^\n]", action, name, kind);
+    if (n >= 1) {
+        if (strcmp(action, "INCOMING") == 0) {
+            uint32_t uid = esp_random();
+            phone_call(uid, name[0] ? name : NULL, kind[0] ? kind : NULL);
+        } else if (strcmp(action, "ENDED") == 0) {
+            phone_call(0, NULL, NULL);
+        }
+    }
+    call_len = 0;
+}
+
+static void generic_call_state(const uint8_t *d, int len)
+{
+    if (call_len + len >= (int)sizeof call_buf) call_len = 0;
+    memcpy(call_buf + call_len, d, len);
+    call_len += len;
+    if (len > 0 && d[len - 1] == '\n') generic_call_state_flush();
+}
+
+/* ---------- generic media track for Android/Windows ---------- */
+/* "Название|Исполнитель|258|102.5|1\n" -> title|artist|duration|position|playing(0/1) */
+static char track_buf[256];
+static int track_len;
+
+static void generic_media_track_flush(void)
+{
+    if (track_len < 3) { track_len = 0; return; }
+    track_buf[track_len] = 0;
+    char title[64] = "", artist[48] = "";
+    int dur = 0;
+    float pos = 0;
+    int playing = 0;
+    int n = sscanf(track_buf, "%63[^|]|%47[^|]|%d|%f|%d", title, artist, &dur, &pos, &playing);
+    if (n >= 2) {
+        phone_track(title[0] ? title : NULL, artist[0] ? artist : NULL, dur, pos, playing != 0);
+    }
+    track_len = 0;
+}
+
+static void generic_media_track(const uint8_t *d, int len)
+{
+    if (track_len + len >= (int)sizeof track_buf) track_len = 0;
+    memcpy(track_buf + track_len, d, len);
+    track_len += len;
+    if (len > 0 && d[len - 1] == '\n') generic_media_track_flush();
+}
+
+
 /* ---------- commands from the UI (called in the LVGL task) ---------- */
 static void command(int cmd, uint32_t uid)
 {
     static const uint8_t remote[] = {[PHONE_PLAY_PAUSE] = 2, [PHONE_NEXT] = 3, [PHONE_PREV] = 4, [PHONE_VOL_UP] = 5, [PHONE_VOL_DOWN] = 6};
+    /* Android/Windows: the companion app executes the command. Pairing stays NimBLE's own (numeric comparison). */
+    if (comp_ready && cmd != PHONE_PAIR_OK && cmd != PHONE_PAIR_CANCEL && comp_command(cmd, uid)) return;
     switch (cmd) {
-    case PHONE_NOTE_DISMISS: ancs_action(uid, 1); break;
-    case PHONE_CALL_ANSWER: ancs_action(uid, 0); break;
-    case PHONE_CALL_DECLINE: ancs_action(uid, 1); break;
+    case PHONE_NOTE_DISMISS:
+        if (b.type == PHONE_TYPE_IPHONE) ancs_action(uid, 1);
+        else phone_note_gone(uid); /* generic: just drop it locally */
+        break;
+    case PHONE_CALL_ANSWER:
+        if (b.type == PHONE_TYPE_IPHONE) ancs_action(uid, 0);
+        else if (b.cc) { uint8_t v = 1; ble_gattc_write_flat(b.conn, b.cc, &v, 1, NULL, NULL); }
+        break;
+    case PHONE_CALL_DECLINE:
+        if (b.type == PHONE_TYPE_IPHONE) ancs_action(uid, 1);
+        else if (b.cc) { uint8_t v = 0; ble_gattc_write_flat(b.conn, b.cc, &v, 1, NULL, NULL); }
+        break;
     case PHONE_PLAY_PAUSE:
     case PHONE_NEXT:
     case PHONE_PREV:
@@ -273,7 +403,7 @@ static int on_read(uint16_t conn, const struct ble_gatt_error *err, struct ble_g
         tz_min = zone;
         ESP_LOGI(TAG, "time from the iPhone: %04d-%02d-%02d %02d:%02d, UTC%+d min", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, zone);
     }
-    if (err->status != BLE_HS_EDONE) step();
+    if (err->status != BLE_HS_EDONE) (b.type == PHONE_TYPE_IPHONE ? step : step_generic)();
     return 0;
 }
 
@@ -334,6 +464,12 @@ static int on_chr(uint16_t conn, const struct ble_gatt_error *err, const struct 
         else if (!ble_uuid_cmp(u, &AMS_EU.u)) b.eu = c->val_handle;
         else if (!ble_uuid_cmp(u, &CTS_TIME.u)) b.ct = c->val_handle;
         else if (!ble_uuid_cmp(u, &CTS_LOCAL.u)) b.lt = c->val_handle;
+        /* generic (non-Apple) services: Android/Windows */
+        else if (!ble_uuid_cmp(u, &GATT_NOTIFY_CHR.u)) b.ns = c->val_handle;
+        else if (!ble_uuid_cmp(u, &GATT_MEDIA_CTRL.u)) b.rc = c->val_handle;
+        else if (!ble_uuid_cmp(u, &GATT_MEDIA_TRACK.u)) b.eu = c->val_handle;
+        else if (!ble_uuid_cmp(u, &GATT_CALL_STATE.u)) b.cs = c->val_handle;
+        else if (!ble_uuid_cmp(u, &GATT_CALL_CTRL.u)) b.cc = c->val_handle;
     }
     if (err->status) step();
     return 0;
@@ -366,7 +502,8 @@ static bool subscribe(void)
 static uint16_t ancs_end, ams_end;
 static struct ble_npl_callout again; /* runs in the host task, like the GATT callbacks */
 static void step(void);
-static void look_again(struct ble_npl_event *ev) { (void)ev; if (b.connected) b.step = 0, step(); }
+static void step_generic(void);   /* Android/Windows: generic GATT notification + media services */
+static void look_again(struct ble_npl_event *ev) { (void)ev; if (b.connected) b.step = 0, (b.type == PHONE_TYPE_IPHONE ? step : step_generic)(); }
 
 static void step(void)
 {
@@ -406,8 +543,10 @@ static void step(void)
             }
             if (!b.ns && !b.eu && !b.is_phone) { /* no notifications and no music: a computer, for the remote; the phone's place is free */
                 uint16_t c = b.conn;
-                b = (typeof(b)){.own_addr = b.own_addr, .conn = BLE_HS_CONN_HANDLE_NONE};
-                ui(ui_link_off, NULL);
+                uint8_t own = b.own_addr;
+                int type = b.type;
+                b = (typeof(b)){.own_addr = own, .conn = BLE_HS_CONN_HANDLE_NONE, .type = type};
+                link_sync();
                 host_take(c);
                 return;
             }
@@ -415,12 +554,49 @@ static void step(void)
             if (addr_add(b.conn, phones, &phones_n, "phones")) /* a new phone: it may have read the computer's keys */
                 ble_svc_gatt_changed(0x0001, 0xFFFF);
             b.ready = true;
-            ui(ui_link_on, NULL);
+            link_sync();
             ancs_fetch(); /* what queued up while we were looking around */
             return;
         default: return;
         }
         if (started) return; /* its callback comes back here */
+    }
+}
+
+/* Android/Windows: discover generic notification, call and media services, then CTS time */
+static void step_generic(void)
+{
+    for (;;) {
+        bool started = false;
+        switch (b.step++) {
+        case 0: started = find_svc(&GATT_NOTIFY.u); break;
+        case 1: started = find_chrs(); break;
+        case 2: started = find_svc(&GATT_CALL.u); break;
+        case 3: started = find_chrs(); break;
+        case 4: started = find_svc(&GATT_MEDIA.u); break;
+        case 5: started = find_chrs(); break;
+        case 6: started = find_svc(&CTS.u); break;
+        case 7: started = find_chrs(); break;
+        case 8: started = find_cccd(b.ns, 0xFFFF); break; /* subscribe to notifications */
+        case 9: started = subscribe(); break;
+        case 10: started = find_cccd(b.cs, 0xFFFF); break; /* subscribe to call state */
+        case 11: started = subscribe(); break;
+        case 12:
+            if (!b.ns && !b.eu && !b.cs && !b.ct && b.retries++ < 3) {
+                ESP_LOGW(TAG, "no generic services found, looking again in 2 s");
+                ble_npl_callout_reset(&again, ble_npl_time_ms_to_ticks32(2000));
+                return;
+            }
+            ESP_LOGI(TAG, "generic phone ready: notify %s, call %s, media %s, CTS %s",
+                     b.ns ? "yes" : "no", b.cs ? "yes" : "no", b.eu ? "yes" : "no", b.ct ? "yes" : "no");
+            if (addr_add(b.conn, phones, &phones_n, "phones"))
+                ble_svc_gatt_changed(0x0001, 0xFFFF);
+            b.ready = true;
+            link_sync();
+            return;
+        default: return;
+        }
+        if (started) return;
     }
 }
 
@@ -500,6 +676,142 @@ static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
     return BLE_ATT_ERR_UNLIKELY;
 }
 
+/* ---------- Pip Link: the companion app (docs/companion.md) ---------- */
+static void companion_claim(uint16_t conn); /* cancel the "is it the phone?" grace when the app writes to us */
+
+static void comp_send(const char *fmt, ...)
+{
+    if (!comp_ready || comp_conn == BLE_HS_CONN_HANDLE_NONE || !comp_tx_handle) return;
+    char b[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n >= (int)sizeof b) n = (int)sizeof b - 1;
+    ble_gatts_notify_custom(comp_conn, comp_tx_handle, ble_hs_mbuf_from_flat(b, (uint16_t)n));
+}
+
+static int comp_split(char *s, char **f, int max)
+{
+    int n = 0;
+    f[n++] = s;
+    for (; *s && n < max; s++)
+        if (*s == '|') *s = 0, f[n++] = s + 1;
+    return n;
+}
+
+static void comp_time(const char *s)
+{
+    char *e;
+    long long t = strtoll(s, &e, 10);
+    int tz = (int)strtol(e, NULL, 10);
+    if (t > 1735689600) { /* after 2025-01-01: a real clock, not 1970 */
+        struct timeval tv = {.tv_sec = (time_t)t};
+        settimeofday(&tv, NULL);
+        tz_min = tz;
+        ESP_LOGI(TAG, "time from the companion: UTC%+d min", tz);
+    }
+}
+
+static void comp_handle_line(char *line)
+{
+    if (!strncmp(line, "HELLO ", 6)) {
+        comp_ready = true;
+        link_sync();
+        comp_send("OK HELLO 1\n");
+        comp_send("PRIVACY %d\n", phone_privacy());
+        bool ch = false;
+        int bat = shell_battery_level(&ch);
+        comp_send("STATE %d %d\n", bat, ch ? 1 : 0);
+        ESP_LOGI(TAG, "companion connected: %s", line + 6);
+        return;
+    }
+    if (!comp_ready) return;
+    if (!strncmp(line, "TIME ", 5)) { comp_time(line + 5); return; }
+    if (!strncmp(line, "PING", 4)) { comp_send("PONG\n"); return; }
+    if (!strncmp(line, "VOL ", 4)) {
+        ui_lock();
+        phone_volume((float)atoi(line + 4) / 100.0f);
+        ui_unlock();
+        return;
+    }
+    char *f[8];
+    if (!strncmp(line, "NOTE ", 5)) {
+        int n = comp_split(line + 5, f, 7);
+        if (n < 4) return;
+        uint32_t uid = (uint32_t)strtoul(f[0], NULL, 10);
+        ui_lock();
+        phone_note(uid, f[1], f[2], f[3], n > 4 ? atoi(f[4]) : 0, n > 5 ? atoi(f[5]) : 0, n > 6 && atoi(f[6]));
+        ui_unlock();
+    } else if (!strncmp(line, "NOTE_GONE ", 10)) {
+        ui_lock();
+        phone_note_gone((uint32_t)strtoul(line + 10, NULL, 10));
+        ui_unlock();
+    } else if (!strncmp(line, "CALL_END", 8)) {
+        ui_lock();
+        phone_call(0, NULL, NULL);
+        ui_unlock();
+    } else if (!strncmp(line, "CALL ", 5)) {
+        int n = comp_split(line + 5, f, 3);
+        if (n < 1) return;
+        uint32_t uid = (uint32_t)strtoul(f[0], NULL, 10);
+        ui_lock();
+        phone_call(uid, n > 1 && f[1][0] ? f[1] : "Телефон", n > 2 && f[2][0] ? f[2] : "мобильный");
+        ui_unlock();
+    } else if (!strncmp(line, "TRACK ", 6)) {
+        int n = comp_split(line + 6, f, 5);
+        if (n < 2) return;
+        ui_lock();
+        phone_track(f[0][0] ? f[0] : NULL, f[1], n > 2 ? atoi(f[2]) : 0, n > 3 ? (float)atof(f[3]) : 0, n > 4 && atoi(f[4]));
+        ui_unlock();
+    }
+}
+
+static int comp_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)attr;
+    (void)arg;
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        static const char info[] = "Pip companion 1\n";
+        return read_flat(ctxt, info, sizeof info - 1);
+    }
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return 0;
+    if (comp_conn != BLE_HS_CONN_HANDLE_NONE && comp_conn != conn) return BLE_ATT_ERR_INSUFFICIENT_RES;
+    if (comp_conn != conn) comp_conn = conn, companion_claim(conn);
+    uint8_t d[200];
+    uint16_t n = 0;
+    ble_hs_mbuf_to_flat(ctxt->om, d, sizeof d, &n);
+    for (int i = 0; i < n; i++) {
+        char c = (char)d[i];
+        if (c == '\n') {
+            comp_buf[comp_len] = 0;
+            comp_handle_line(comp_buf);
+            comp_len = 0;
+        } else if (c != '\r' && comp_len < COMP_LINE - 1) {
+            comp_buf[comp_len++] = c;
+        }
+    }
+    return 0;
+}
+
+static bool comp_command(int cmd, uint32_t uid)
+{
+    switch (cmd) {
+    case PHONE_NOTE_DISMISS: comp_send("CMD DISMISS %u\n", (unsigned)uid); return true;
+    case PHONE_CALL_ANSWER: comp_send("CMD ANSWER %u\n", (unsigned)uid); return true;
+    case PHONE_CALL_DECLINE: comp_send("CMD DECLINE %u\n", (unsigned)uid); return true;
+    case PHONE_PLAY_PAUSE: comp_send("CMD PLAY_PAUSE\n"); return true;
+    case PHONE_NEXT: comp_send("CMD NEXT\n"); return true;
+    case PHONE_PREV: comp_send("CMD PREV\n"); return true;
+    case PHONE_VOL_UP: comp_send("CMD VOL_UP\n"); return true;
+    case PHONE_VOL_DOWN: comp_send("CMD VOL_DOWN\n"); return true;
+    }
+    return false;
+}
+
+void ble_companion_privacy(int mode) { if (comp_ready) comp_send("PRIVACY %d\n", mode); }
+
 static int dbg_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static ble_uuid128_t DBG, DBG_RX, DBG_TX;
 static uint16_t dbg_tx;
@@ -533,7 +845,7 @@ static const struct ble_gatt_svc_def services[] = {
      .characteristics = (struct ble_gatt_chr_def[]){
          {.uuid = BLE_UUID16_DECLARE(0x2A50), .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ},
          {.uuid = BLE_UUID16_DECLARE(0x2A29), .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ}, {0}}},
-    /* last: the computer's (added after the rest so the handles the iPhone has cached do not move) */
+    /* the computer's, then the companion app's: both added after the rest so the iPhone's cached handles do not move */
     {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = BLE_UUID16_DECLARE(0x1812),
      .characteristics = (struct ble_gatt_chr_def[]){
          {.uuid = BLE_UUID16_DECLARE(0x2A4A), .access_cb = hid_access, .arg = HOST_REPORT(1), .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC},
@@ -543,6 +855,15 @@ static const struct ble_gatt_svc_def services[] = {
          HOST_INPUT(3, media_handle),
          {.uuid = BLE_UUID16_DECLARE(0x2A4C), .access_cb = hid_access, .arg = HOST_REPORT(1), .flags = BLE_GATT_CHR_F_WRITE_NO_RSP},
          {.uuid = BLE_UUID16_DECLARE(0x2A4E), .access_cb = hid_access, .arg = HOST_REPORT(1), .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP},
+         {0}}},
+    /* Pip Link: the Android/Windows companion app (docs/companion.md) */
+    {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &COMP.u,
+     .characteristics = (struct ble_gatt_chr_def[]){
+         {.uuid = &COMP_RX.u, .access_cb = comp_access,
+          .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC},
+         {.uuid = &COMP_TX.u, .access_cb = comp_access, .val_handle = &comp_tx_handle, .flags = BLE_GATT_CHR_F_NOTIFY},
+         {.uuid = &COMP_INFO.u, .access_cb = comp_access, .val_handle = &comp_info_handle,
+          .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC},
          {0}}},
     {0},
 };
@@ -657,6 +978,14 @@ static int64_t since[8]; /* when each connection came (handles are small numbers
 static struct ble_npl_callout claim;
 static void advertise(void);
 
+/* The app writes to Pip Link at once: it is neither the phone nor a computer, so do not let the 4 s "phone?" timer
+   claim it (the same idea as the debug page's first write). */
+static void companion_claim(uint16_t conn)
+{
+    if (pending == conn) ble_npl_callout_stop(&claim), pending = BLE_HS_CONN_HANDLE_NONE;
+    if (pending2 == conn) pending2 = BLE_HS_CONN_HANDLE_NONE;
+}
+
 static void phone_take(uint16_t conn)
 {
     ble_npl_callout_stop(&claim);
@@ -666,7 +995,9 @@ static void phone_take(uint16_t conn)
         ble_gap_security_initiate(conn);
         return;
     }
-    b = (typeof(b)){.own_addr = b.own_addr, .conn = conn, .connected = true};
+    uint8_t own = b.own_addr;
+    int type = b.type;
+    b = (typeof(b)){.own_addr = own, .conn = conn, .connected = true, .type = type};
     q_n = 0, fetching = false;
     ESP_LOGI(TAG, "connected");
     ble_gattc_exchange_mtu(b.conn, NULL, NULL);
@@ -683,16 +1014,31 @@ static void decide(uint16_t c, int cat)
 {
     bool slot = c == b.conn || !b.connected;
     if (cat > 1 || (cat != 1 && !slot)) { /* anything that is not a phone: a Mac calls itself a "media player" (0x0280) */
-        if (c == b.conn) b = (typeof(b)){.own_addr = b.own_addr, .conn = BLE_HS_CONN_HANDLE_NONE}, ui(ui_link_off, NULL);
+        if (c == b.conn) {
+            uint8_t own = b.own_addr;
+            int type = b.type;
+            b = (typeof(b)){.own_addr = own, .conn = BLE_HS_CONN_HANDLE_NONE, .type = type};
+            link_sync();
+        }
         host_take(c);
         return;
     }
     if (!slot) { ESP_LOGW(TAG, "a second phone: left alone"); return; }
     if (c != b.conn) {
-        b = (typeof(b)){.own_addr = b.own_addr, .conn = c, .connected = true};
+        uint8_t own = b.own_addr;
+        int type = b.type;
+        b = (typeof(b)){.own_addr = own, .conn = c, .connected = true, .type = type};
         q_n = 0, fetching = false;
         ble_gattc_exchange_mtu(c, NULL, NULL);
         advertise();
+    }
+    if (b.type != PHONE_TYPE_IPHONE) {
+        /* Android/Windows: no ANCS to discover. Wait for the companion app's HELLO over Pip Link; without the app
+           this connection stays a plain Bluetooth host (remote/media keys only). */
+        b.is_phone = true;
+        b.ready = false;
+        link_sync();
+        return;
     }
     b.is_phone = cat == 1;
     b.step = 0, b.retries = 0;
@@ -809,6 +1155,12 @@ static int gap_event(struct ble_gap_event *e, void *arg)
         }
         if (e->disconnect.conn.conn_handle == pending) { ble_npl_callout_stop(&claim), pending = BLE_HS_CONN_HANDLE_NONE; advertise(); break; }
         if (e->disconnect.conn.conn_handle == pending2) { pending2 = BLE_HS_CONN_HANDLE_NONE; advertise(); break; }
+        if (e->disconnect.conn.conn_handle == comp_conn) {
+            comp_conn = BLE_HS_CONN_HANDLE_NONE, comp_ready = false, comp_len = 0;
+            ESP_LOGI(TAG, "companion left");
+            link_sync();
+            /* fall through: the same link may also be the phone slot or the computer */
+        }
         if (e->disconnect.conn.conn_handle == host_conn) {
             host_conn = BLE_HS_CONN_HANDLE_NONE;
             ESP_LOGI(TAG, "the computer left");
@@ -818,7 +1170,7 @@ static int gap_event(struct ble_gap_event *e, void *arg)
         }
         ESP_LOGI(TAG, "disconnected (%d)", e->disconnect.reason);
         b.connected = false, b.conn = BLE_HS_CONN_HANDLE_NONE;
-        ui(ui_link_off, NULL);
+        link_sync();
         advertise();
         break;
     case BLE_GAP_EVENT_PASSKEY_ACTION: {
@@ -843,7 +1195,7 @@ static int gap_event(struct ble_gap_event *e, void *arg)
         if (c == host_conn) break; /* the computer again */
         if (e->enc_change.status) {
             ESP_LOGI(TAG, "encryption failed");
-            if (c == b.conn) ui(ui_link_off, NULL);
+            if (c == b.conn) link_sync();
             if (c == pending2) pending2 = BLE_HS_CONN_HANDLE_NONE, ui(ui_host_off, NULL);
             break;
         }
@@ -864,9 +1216,15 @@ static int gap_event(struct ble_gap_event *e, void *arg)
         uint16_t n = 0;
         ble_hs_mbuf_to_flat(e->notify_rx.om, d, sizeof d, &n);
         uint16_t h = e->notify_rx.attr_handle;
-        if (h == b.ns) ancs_source(d, n);
-        else if (h == b.ds) ancs_data(d, n);
-        else if (h == b.eu) ams_update(d, n);
+        if (b.type == PHONE_TYPE_IPHONE) {
+            if (h == b.ns) ancs_source(d, n);
+            else if (h == b.ds) ancs_data(d, n);
+            else if (h == b.eu) ams_update(d, n);
+        } else {
+            if (h == b.ns) generic_notify(d, n);
+            else if (h == b.cs) generic_call_state(d, n);
+            else if (h == b.eu) ams_update(d, n); /* media keys still work via AMS-like attribute */
+        }
         break;
     }
     }
@@ -892,6 +1250,14 @@ static void bt_query(phone_bt_t *s)
 {
     memset(s, 0, sizeof *s);
     bt_peer(s, b.conn, PEER_PHONE);
+    if (comp_conn != BLE_HS_CONN_HANDLE_NONE && comp_conn != b.conn && comp_conn != host_conn && comp_conn != dbg_conn) {
+        int before = s->n;
+        bt_peer(s, comp_conn, PEER_PHONE);
+        if (s->n > before) { /* the companion app's own link: notifications, music and time */
+            phone_peer_t *p = &s->peer[s->n - 1];
+            p->ready = comp_ready, p->ancs = comp_ready, p->ams = comp_ready, p->cts = comp_ready, p->type = b.type;
+        }
+    }
     bt_peer(s, host_conn, PEER_COMPUTER);
     bt_peer(s, dbg_conn, PEER_DEBUG); /* may be the computer's own link: Chrome on the same Mac */
     bt_peer(s, pending, PEER_UNKNOWN);
@@ -907,9 +1273,10 @@ static void bt_act(int what)
         return;
     }
     /* forget everyone: every link down, every bond, and who was a phone or a computer */
-    const uint16_t cs[] = {b.conn, host_conn, dbg_conn, pending, pending2};
+    const uint16_t cs[] = {b.conn, host_conn, dbg_conn, comp_conn, pending, pending2};
     for (unsigned i = 0; i < sizeof cs / sizeof cs[0]; i++)
         if (cs[i] != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(cs[i], BLE_ERR_REM_USER_CONN_TERM);
+    comp_conn = BLE_HS_CONN_HANDLE_NONE, comp_ready = false, comp_len = 0;
     ble_store_clear();
     hosts_n = phones_n = 0;
     nvs_handle_t h;
@@ -925,9 +1292,10 @@ void ble_quiet(bool q)
     quiet = q;
     if (!q) { advertise(); ESP_LOGI(TAG, "awake: advertising again"); return; }
     ble_gap_adv_stop();
-    const uint16_t cs[] = {b.conn, host_conn, dbg_conn, pending, pending2}; /* the iPhone reconnects by itself when we are back */
+    const uint16_t cs[] = {b.conn, host_conn, dbg_conn, comp_conn, pending, pending2}; /* the iPhone reconnects by itself when we are back */
     for (unsigned i = 0; i < sizeof cs / sizeof cs[0]; i++)
         if (cs[i] != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(cs[i], BLE_ERR_REM_USER_CONN_TERM);
+    comp_conn = BLE_HS_CONN_HANDLE_NONE, comp_ready = false, comp_len = 0;
     ESP_LOGI(TAG, "asleep: Bluetooth off the air");
 }
 
@@ -950,7 +1318,7 @@ static void advertise(void)
 
 /* Bump when the services table changes: phones and computers bonded to the old one are told once (Service Changed, on
    their next connection) to look at our services again instead of trusting the handles they cached. */
-#define GATT_LAYOUT 2 /* 2: the computer's service gained the keyboard and media reports */
+#define GATT_LAYOUT 3 /* 3: the Pip Link companion service */
 
 static void gatt_layout_check(void)
 {
@@ -989,9 +1357,24 @@ void ble_start(void)
     uuid(&AMS, "89D3502B-0F36-433A-8EF4-C502AD55F8DC");
     uuid(&AMS_RC, "9B3C81D8-57B1-4A8A-B8DF-0E56F7CA51C2");
     uuid(&AMS_EU, "2F7CABCE-808D-411F-9A0C-BB92BA96C102");
+    /* generic (non-Apple) services: any Android/Windows host may expose these */
+    uuid(&GATT_NOTIFY,   "C6A2F3E1-8B4D-421A-9F7C-3D5E6F7A8B9C");
+    uuid(&GATT_NOTIFY_CHR,"D1B4C2E3-5F6A-4B8C-9D0E-1F2A3B4C5D6E");
+    uuid(&GATT_MEDIA,    "E2F3A4B5-C6D7-4E8F-9A0B-1C2D3E4F5A6B");
+    uuid(&GATT_MEDIA_CTRL,"F3A4B5C6-D7E8-4F9A-0B1C-2D3E4F5A6B7C");
+    uuid(&GATT_MEDIA_TRACK,"A4B5C6D7-E8F9-4A0B-1C2D-3E4F5A6B7C8D");
+    /* generic call service for Android/Windows */
+    uuid(&GATT_CALL,      "B1A2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D");
+    uuid(&GATT_CALL_STATE,"C2D3E4F5-A6B7-4C8D-9E0F-1A2B3C4D5E6F");
+    uuid(&GATT_CALL_CTRL, "D3E4F5A6-B7C8-4D9E-0F1A-2B3C4D5E6F7A");
     uuid(&DBG, "50495044-4247-4B45-5950-455400000001");
     uuid(&DBG_RX, "50495044-4247-4B45-5950-455400000002");
     uuid(&DBG_TX, "50495044-4247-4B45-5950-455400000003");
+    /* Pip Link: the companion app's service (docs/companion.md) */
+    uuid(&COMP, "50495044-4247-4B45-5950-455400000010");
+    uuid(&COMP_RX, "50495044-4247-4B45-5950-455400000011");
+    uuid(&COMP_TX, "50495044-4247-4B45-5950-455400000012");
+    uuid(&COMP_INFO, "50495044-4247-4B45-5950-455400000013");
     if (nimble_port_init() != ESP_OK) { ESP_LOGE(TAG, "NimBLE did not start"); return; }
     ble_npl_callout_init(&again, nimble_port_get_dflt_eventq(), look_again, NULL);
     ble_npl_callout_init(&claim, nimble_port_get_dflt_eventq(), claim_phone, NULL);

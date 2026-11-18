@@ -217,7 +217,14 @@ details p{margin:8px 0 0}
         </div>
 
         <div class="card">
-          <h3>Уведомления с iPhone</h3>
+          <h3>Уведомления и телефон</h3>
+          <div><label for="phonetype">Устройство для уведомлений</label>
+            <select id="phonetype">
+              <option value="0">iPhone (ANCS, музыка, камера)</option>
+              <option value="1">Android (приложение Pip Link)</option>
+              <option value="2">Windows (приложение Pip Link)</option>
+            </select></div>
+          <p class="muted">iPhone работает без приложения. Для Android и Windows установи приложение <b>Pip Link</b> из папки <code>apps</code>: без него будут только пульт, медиа-клавиши и затвор камеры, а уведомлений и звонков не будет.</p>
           <div><label for="privacy">Что видно на экране брелока</label>
             <select id="privacy">
               <option value="1">Скрыто: приложение и время, текст — когда откроешь</option>
@@ -226,6 +233,7 @@ details p{margin:8px 0 0}
             </select></div>
           <p class="muted">Коды, пароли и банки брелок не сохраняет ни в каком режиме.</p>
           <p class="muted"><b style="color:var(--text)">Подключить iPhone:</b> Настройки → Bluetooth → Pip, затем подтверди код на брелоке верхней кнопкой.</p>
+          <p class="muted"><b style="color:var(--text)">Подключить Android/Windows:</b> установи и открой <b>Pip Link</b>, нажми «Подключить» и подтверди код на брелоке верхней кнопкой. Приложение попросит доступ к уведомлениям (Android) — без него уведомления не приходят.</p>
         </div>
 
         <div class="card wide">
@@ -412,6 +420,7 @@ function fill() {
   $('bright').value = cfg.bright; $('brightOut').textContent = cfg.bright + '%';
   $('eco').checked = !!cfg.eco;
   $('theme').value = cfg.theme; $('privacy').value = cfg.privacy;
+  $('phonetype').value = cfg.phonetype != null ? cfg.phonetype : 0;
   for (const [f] of FEATS) $('f' + f).checked = !!cfg.feat[f];
   $('ver').textContent = cfg.ver || '—';
   $('needlink').textContent = 'Изменения сохраняются в самом брелоке сразу.';
@@ -427,6 +436,7 @@ $('bright').onchange = e => send('bright ' + e.target.value);
 $('eco').onchange = e => send('eco ' + (e.target.checked ? 1 : 0));
 $('theme').onchange = e => send('theme ' + e.target.value);
 $('privacy').onchange = e => send('privacy ' + e.target.value);
+$('phonetype').onchange = e => send('phonetype ' + e.target.value);
 $('feats').onchange = e => send(`feat ${e.target.id.slice(1)} ${e.target.checked ? 1 : 0}`);
 
 /* ---------- tabs ---------- */
